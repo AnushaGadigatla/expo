@@ -4,16 +4,22 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.Paint
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureRequest
 import android.media.AudioManager
 import android.media.MediaActionSound
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import android.view.OrientationEventListener
 import android.view.Surface
@@ -23,6 +29,7 @@ import android.view.WindowManager
 import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraInfo
@@ -80,6 +87,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.math.roundToInt
 import kotlin.properties.Delegates
@@ -126,6 +134,7 @@ class ExpoCameraView(
   private var recorder: Recorder? = null
   private var barcodeFormats: List<BarcodeType> = emptyList()
   private var glSurface: SurfaceTexture? = null
+  private var exposureDurationNs: Long = (1000 * 1_000_000).toLong()
 
   private var previewView = PreviewView(context).apply {
     elevation = 0f
@@ -293,6 +302,91 @@ class ExpoCameraView(
     )
   }
 
+  fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
+    val buffer = imageProxy.planes[0].buffer
+    val bytes = ByteArray(buffer.capacity())
+    buffer.get(bytes)
+    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+  }
+  fun blendImages(images: List<Bitmap>): Bitmap {
+    val blendedBitmap = Bitmap.createBitmap(images[0].width, images[0].height, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(blendedBitmap)
+    val paint = Paint().apply {
+      alpha = (255 / images.size) // Adjust alpha based on the number of images
+    }
+
+    for (bitmap in images) {
+      canvas.drawBitmap(bitmap, 0f, 0f, paint)
+    }
+
+    return blendedBitmap
+  }
+  fun captureLongExposureShot(options: PictureOptions, promise: Promise, cacheDirectory: File) {
+    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    val volume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+    val imageList = mutableListOf<Bitmap>()
+
+    for (i in 1..4) {
+      imageCaptureUseCase?.takePicture(
+        ContextCompat.getMainExecutor(context),
+        object : ImageCapture.OnImageCapturedCallback() {
+          override fun onCaptureStarted() {
+            if (volume != 0) {
+              MediaActionSound().play(MediaActionSound.SHUTTER_CLICK)
+            }
+            if (!animateShutter) {
+              return
+            }
+            rootView.postDelayed({
+              rootView.foreground = ColorDrawable(Color.WHITE)
+              rootView.postDelayed(
+                { rootView.foreground = null },
+                ANIMATION_FAST_MILLIS
+              )
+            }, ANIMATION_SLOW_MILLIS)
+          }
+
+
+          override fun onCaptureSuccess(imageProxy: ImageProxy) {
+
+            val bitmap = imageProxyToBitmap(imageProxy)
+            imageList.add(bitmap)
+            imageProxy.close()
+            Log.d("imgL", "${imageList.size}")
+            if (imageList.size == 4) {
+              val blendedImageBitmap = blendImages(imageList)
+              val imageStream = ByteArrayOutputStream()
+              blendedImageBitmap.compress(Bitmap.CompressFormat.JPEG, 100, imageStream)
+              val imageData = imageStream.toByteArray()
+              if (options.fastMode) {
+                promise.resolve(null)
+              }
+              Log.d("PictureTaken", "taken $imageData")
+              cacheDirectory.let {
+                scope.launch {
+                  val shouldMirror = mirror && lensFacing == CameraType.FRONT
+                  ResolveTakenPicture(
+                    imageData,
+                    promise,
+                    options,
+                    shouldMirror,
+                    it
+                  ) { response: Bundle ->
+                    onPictureSaved(response)
+                  }.resolve()
+                }
+              }
+              imageList.removeAll(imageList);
+            }
+          }
+
+          override fun onError(exception: ImageCaptureException) {
+            promise.reject(CameraExceptions.ImageCaptureFailed())
+          }
+        })
+    }
+  }
+
   fun setCameraFlashMode(mode: FlashMode) {
     if (imageCaptureUseCase?.flashMode != mode.mapToLens()) {
       imageCaptureUseCase?.flashMode = mode.mapToLens()
@@ -351,6 +445,23 @@ class ExpoCameraView(
       ?: promise.reject("E_RECORDING_FAILED", "Starting video recording failed - could not create video file.", null)
   }
 
+  @OptIn(ExperimentalCamera2Interop::class)
+  fun getAvailableExposureRange(): Any {
+    Log.d("camera2Interop","getAvailableExposureRange entered")
+    Log.d("camera2Interop","getAvailableExposureRange camera $camera")
+//    Log.d("camera2Interop","getAvailableExposureRange cameraInfo $camera?.cameraInfo")
+
+    return camera?.cameraInfo?.let { cameraInfo ->
+      // Access the Camera2 characteristics via Camera2Interop
+
+      val exposureRange: Range<Long>? = Camera2CameraInfo.from(cameraInfo)
+        .getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+      // Check if exposureRange is not null and return its range in a formatted list
+      exposureRange
+    } ?: ""
+  }
+
+
   @SuppressLint("UnsafeOptInUsageError")
   fun createCamera() {
     if (!shouldCreateCamera || previewPaused) {
@@ -388,9 +499,28 @@ class ExpoCameraView(
           .requireLensFacing(lensFacing.mapToCharacteristic())
           .build()
 
-        imageCaptureUseCase = ImageCapture.Builder()
+//        imageCaptureUseCase = ImageCapture.Builder()
+//          .setResolutionSelector(resolutionSelector)
+//          .build()
+
+
+        val imageCaptureBuilder = ImageCapture.Builder()
           .setResolutionSelector(resolutionSelector)
-          .build()
+          .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+
+        Log.d("camera2Interop","CameraInterop entered");
+
+//        val info = Camera2CameraInfo.from(cameraInfo).getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val info = getAvailableExposureRange();
+        val camera2Interop = Camera2Interop.Extender(imageCaptureBuilder!!)
+        camera2Interop.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+        camera2Interop.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, 1600)
+        camera2Interop.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureDurationNs)
+        camera2Interop.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+
+        camera2Interop.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f);
+        Log.d("camera2Interop","$info");
+        imageCaptureUseCase = imageCaptureBuilder.build()
 
         val videoCapture = createVideoCapture()
         imageAnalysisUseCase = createImageAnalyzer()
